@@ -1,0 +1,248 @@
+# ---------------------------------
+# Airflow shared config
+# ---------------------------------
+x-airflow-image: &airflow_image
+  context: .
+  dockerfile: Dockerfile.airflow
+
+x-airflow-env: &airflow_env
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/airflow_metadata
+  AIRFLOW__WEBSERVER__WORKERS: 1
+  AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: 120
+  PIP_CONFIG_FILE: /etc/pip.conf
+  PYTHONPATH: /opt/airflow
+  BACKUP_DIR: ${BACKUP_DIR:-/backups}
+  BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+  BACKUP_SCHEDULE_CRON: ${BACKUP_SCHEDULE_CRON:-0 3 * * *}
+  POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+  POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+  POSTGRES_DB: ${POSTGRES_DB:-weather}
+  POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  WEATHER_TABLE: weather_data
+
+x-airflow-vols: &airflow_vols
+  - ./dags:/opt/airflow/dags
+  - ./logs:/opt/airflow/logs
+  - ./backups:/backups
+  - ./pip.conf:/etc/pip.conf:ro
+  - ./:/opt/airflow/project:ro
+
+services:
+  # ---------------------------------
+  # FastAPI Service
+  # ---------------------------------
+  api:
+    build: .
+    container_name: api
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    environment:
+      DEFAULT_LAT: ${DEFAULT_LAT:-34.729847}
+      DEFAULT_LON: ${DEFAULT_LON:--86.5859011}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-weather}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-weather}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      WEATHER_TABLE: ${WEATHER_TABLE:-weather_data}
+      BACKUP_DIR: ${BACKUP_DIR:-/backups}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      PIP_CONFIG_FILE: /etc/pip.conf
+    volumes:
+      - ./:/app
+      - ./backups:/backups
+      - ./pip.conf:/etc/pip.conf:ro
+    ports:
+      - "8000:8000"
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          python - <<'PY'
+          import sys, urllib.request
+          try:
+              with urllib.request.urlopen("http://localhost:8000/health", timeout=2) as r:
+                  sys.exit(0 if r.getcode()==200 else 1)
+          except Exception:
+              sys.exit(1)
+          PY
+      interval: 2s
+      timeout: 2s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------
+  # Apache AGE Initialization
+  # ---------------------------------
+  age-init:
+    build: .
+    container_name: age-init
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-weather}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-weather}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      PIP_CONFIG_FILE: /etc/pip.conf
+    volumes:
+      - ./:/app
+      - ./pip.conf:/etc/pip.conf:ro
+    command: python -m app.apache_age_ops
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ---------------------------------
+  # PostgreSQL
+  # ---------------------------------
+  postgres:
+    image: apache/age:release_PG16_1.6.0
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-weather}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./docker/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d weather -h 127.0.0.1"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ---------------------------------
+  # pgAdmin
+  # ---------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:8.12
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---------------------------------
+  # Local PyPI
+  # ---------------------------------
+  pypi:
+    image: pypiserver/pypiserver:latest
+    container_name: local-pypi
+    command: -P . -v /data/packages
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./local-pypi/packages:/data/packages
+    restart: unless-stopped
+    profiles:
+      - pypi
+
+
+  # ---------------------------------
+  # Airflow: init/migrate + admin user
+  # ---------------------------------
+  airflow-init:
+    build: *airflow_image
+    container_name: airflow-init
+    environment:
+      <<: *airflow_env
+      AIRFLOW__LOGGING__LOGGING_LEVEL: WARN
+    user: "${AIRFLOW_UID:-50000}:0"
+    command:
+      [
+        "bash","-c",
+        "airflow db migrate && airflow users create --role Admin --username ${AIRFLOW_ADMIN_USER:-admin} --password ${AIRFLOW_ADMIN_PASSWORD:-admin} --firstname Admin --lastname User --email ${AIRFLOW_ADMIN_EMAIL:-admin@example.com} 2>/dev/null || true"
+      ]
+    volumes: *airflow_vols
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ---------------------------------
+  # Airflow Scheduler
+  # ---------------------------------
+  airflow-scheduler:
+    build: *airflow_image
+    container_name: airflow-scheduler
+    environment:
+      <<: *airflow_env
+    user: "${AIRFLOW_UID:-50000}:0"
+    command: ["python","-m","airflow","scheduler"]
+    volumes: *airflow_vols
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; exit(0 if 'scheduler' in open('/proc/1/cmdline').read() else 1)\""]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ---------------------------------
+  # Airflow Webserver
+  # ---------------------------------
+  airflow-webserver:
+    build: *airflow_image
+    container_name: airflow-webserver
+    environment:
+      <<: *airflow_env
+    user: "${AIRFLOW_UID:-50000}:0"
+    command: ["python","-m","airflow","webserver"]
+    ports:
+      - "8080:8080"
+    volumes: *airflow_vols
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health | grep -q healthy"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+      start_period: 12s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-scheduler:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---------------------------------
+  # Airflow Triggerer (optional)
+  # ---------------------------------
+  airflow-triggerer:
+    build: *airflow_image
+    container_name: airflow-triggerer
+    environment:
+      <<: *airflow_env
+    user: "${AIRFLOW_UID:-50000}:0"
+    command: ["python","-m","airflow","triggerer"]
+    volumes: *airflow_vols
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pg-data:

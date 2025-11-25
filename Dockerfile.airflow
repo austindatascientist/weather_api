@@ -1,0 +1,10 @@
+FROM apache/airflow:2.9.3
+
+# Install additional requirements at build time (not runtime)
+# This eliminates the ~1m30s package download on every startup
+RUN pip install --no-cache-dir \
+    psycopg[binary]==3.2.12 \
+    pyarrow==16.1.0 \
+    pandas==2.1.4
+
+USER airflow
